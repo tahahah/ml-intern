@@ -54,6 +54,7 @@ all = [
 
 [project.scripts]
 ml-intern = "agent.main:cli"
+ml-intern-acp = "agent.happy_acp:cli"
 
 [build-system]
 requires = ["setuptools>=64"]
