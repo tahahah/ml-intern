@@ -13,8 +13,8 @@ The adapter:
     setSessionMode / authenticate / cancel)
   - Translates Happy prompt turns → ml-intern Submission(OpType.USER_INPUT)
   - Streams ml-intern events → ACP sessionUpdate notifications
-  - Handles approval_required ↔ ACP requestPermission (one request per tool)
-  - Maps session/cancel → OpType.INTERRUPT
+  - Handles approval_required ↔ ACP session/request_permission
+  - Maps session/cancel → Session.cancel() directly on the live session
   - Credentials (HF_TOKEN, model keys) stay on the machine; Happy never sees them
 """
 
@@ -39,6 +39,22 @@ from agent.main import Operation, Submission
 logger = logging.getLogger(__name__)
 
 CLI_CONFIG_PATH = Path(__file__).parent.parent / "configs" / "cli_agent_config.json"
+
+# ACP stop reasons
+STOP_END_TURN = "end_turn"
+STOP_CANCELLED = "cancelled"
+STOP_REFUSAL = "refusal"
+
+# Valid ACP tool call statuses
+TOOL_STATUS_PENDING = "pending"
+TOOL_STATUS_IN_PROGRESS = "in_progress"
+TOOL_STATUS_COMPLETED = "completed"
+TOOL_STATUS_FAILED = "failed"
+TOOL_STATUS_CANCELLED = "cancelled"
+
+# Valid ACP tool kinds
+TOOL_KIND_EXECUTE = "execute"
+TOOL_KIND_OTHER = "other"
 
 # ---------------------------------------------------------------------------
 # JSON-RPC 2.0 wire helpers
@@ -79,6 +95,8 @@ class _SessionState:
         self.agent_task: asyncio.Task | None = None
         self.event_task: asyncio.Task | None = None
         self.started: bool = False
+        # Hold a reference to the live Session so cancel() can be called directly
+        self.session_holder: list = [None]
 
     def next_sub_id(self) -> str:
         self._sub_id += 1
@@ -129,20 +147,23 @@ class MlInternAcpServer:
     async def _outgoing_request(self, method: str, params: Any) -> Any:
         """Send a request to the client (Happy) and await its response."""
         req_id = str(uuid.uuid4())
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         await self._write(_rpc_request(req_id, method, params))
         return await fut
 
     # ------------------------------------------------------------------
-    # ACP method handlers (called from main dispatch loop)
+    # ACP method handlers
     # ------------------------------------------------------------------
 
-    async def _on_initialize(self, id_: Any, _params: dict) -> None:
+    async def _on_initialize(self, id_: Any, params: dict) -> None:
+        # Echo back the protocolVersion the client sent, or default to 1
+        proto_version = params.get("protocolVersion", 1)
         await self._write(_rpc_response(id_, {
-            "protocolVersion": "0.14",
+            "protocolVersion": proto_version,
             "agentCapabilities": {"loadSession": False},
-            "displayName": "ML Intern",
+            "agentInfo": {"name": "ML Intern", "version": "0.1.0"},
         }))
 
     async def _on_new_session(self, id_: Any, _params: dict) -> None:
@@ -163,15 +184,22 @@ class MlInternAcpServer:
             await self._write(_rpc_error(id_, -32600, f"Unknown session: {session_id}"))
             return
 
-        # Extract text from ACP content blocks
-        text = _extract_text(params.get("content") or [])
+        # ACP field is "prompt", not "content"
+        text = _extract_text(params.get("prompt") or params.get("content") or [])
+
+        # Create turn_future BEFORE enqueuing to avoid a race where the agent
+        # completes before we set up the future.
+        loop = asyncio.get_event_loop()
+        state.turn_future = loop.create_future()
 
         # Lazily start the ml-intern agent loop on first prompt
         if not state.started:
             state.started = True
             asyncio.create_task(self._start_agent(state))
-            # Give the agent loop a moment to spin up
-            await asyncio.sleep(0.1)
+            # Give the agent loop a moment to spin up before sending input.
+            # A proper approach would wait for a "ready" event; this is a
+            # pragmatic startup delay.
+            await asyncio.sleep(0.3)
 
         # Enqueue user input
         await state.submission_queue.put(
@@ -179,12 +207,13 @@ class MlInternAcpServer:
         )
 
         # Await turn completion
-        loop = asyncio.get_event_loop()
-        state.turn_future = loop.create_future()
         try:
             stop_reason = await state.turn_future
         except asyncio.CancelledError:
-            stop_reason = "cancelled"
+            stop_reason = STOP_CANCELLED
+        except Exception as e:
+            logger.error("Turn future error: %s", e)
+            stop_reason = STOP_REFUSAL
         finally:
             state.turn_future = None
 
@@ -194,11 +223,16 @@ class MlInternAcpServer:
         session_id = params.get("sessionId", "")
         state = self._sessions.get(session_id)
         if state:
-            await state.submission_queue.put(
-                state.make_submission(OpType.INTERRUPT)
-            )
-            if state.turn_future and not state.turn_future.done():
-                state.turn_future.set_result("cancelled")
+            # Cancel the live session directly — this sets the asyncio.Event
+            # that agent_loop checks, interrupting mid-turn work.
+            live_session = state.session_holder[0]
+            if live_session is not None:
+                try:
+                    live_session.cancel()
+                except Exception as e:
+                    logger.warning("Session.cancel() failed: %s", e)
+            # Don't resolve turn_future here — let the `interrupted` event do it
+            # so we don't start a new turn while the old one is still winding down.
         if id_ is not None:
             await self._write(_rpc_response(id_, {}))
 
@@ -212,14 +246,27 @@ class MlInternAcpServer:
             config = load_config(CLI_CONFIG_PATH, include_user_defaults=True)
         except Exception as e:
             logger.error("Failed to load ml-intern config: %s", e)
+            if state.turn_future and not state.turn_future.done():
+                state.turn_future.set_exception(e)
             return
 
         hf_token = resolve_hf_token()
         if not hf_token and not is_local_model_id(config.model_name):
             logger.warning("No HF token. Set HF_TOKEN or run `huggingface-cli login`.")
 
-        tool_router = ToolRouter(config=config, hf_token=hf_token)
-        await tool_router.initialize()
+        # ToolRouter takes mcp_servers dict, not config — fix critical issue #1
+        try:
+            tool_router = ToolRouter(
+                config.mcpServers,
+                hf_token=hf_token,
+                local_mode=False,
+            )
+            await tool_router.initialize()
+        except Exception as e:
+            logger.error("ToolRouter init failed: %s", e)
+            if state.turn_future and not state.turn_future.done():
+                state.turn_future.set_exception(e)
+            return
 
         state.event_task = asyncio.create_task(
             self._consume_events(state)
@@ -231,6 +278,7 @@ class MlInternAcpServer:
                 event_queue=state.event_queue,
                 config=config,
                 tool_router=tool_router,
+                session_holder=state.session_holder,  # fix critical issue #5
                 hf_token=hf_token,
                 local_mode=False,
                 stream=True,
@@ -242,11 +290,12 @@ class MlInternAcpServer:
         except Exception as e:
             logger.error("ml-intern agent loop error: %s", e)
         finally:
-            # Cancel event consumer when agent exits
             if state.event_task and not state.event_task.done():
                 state.event_task.cancel()
             if state.turn_future and not state.turn_future.done():
-                state.turn_future.set_result("error")
+                state.turn_future.set_exception(
+                    RuntimeError("Agent loop exited unexpectedly")
+                )
 
     # ------------------------------------------------------------------
     # Event → ACP translation
@@ -303,26 +352,49 @@ class MlInternAcpServer:
                 "sessionUpdate": "tool_call",
                 "toolCallId": call_id,
                 "title": tool,
-                "kind": "run",
-                "status": "pending",
+                "kind": TOOL_KIND_EXECUTE,   # fix critical issue #6: valid ACP kind
+                "status": TOOL_STATUS_PENDING,
                 "rawInput": raw_input if isinstance(raw_input, dict) else {},
             })
 
         elif et == "tool_output":
             call_id = data.get("tool_call_id", "")
             output = data.get("output", "")
-            is_error = data.get("is_error", False)
+            # ml-intern uses "success" not "is_error" — fix critical issue #6
+            success = data.get("success", not data.get("is_error", False))
+            status = TOOL_STATUS_COMPLETED if success else TOOL_STATUS_FAILED
             await self._session_update(session_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": call_id,
-                "status": "error" if is_error else "completed",
+                "status": status,
                 "content": [{"type": "content",
                               "content": {"type": "text", "text": str(output)}}],
                 "rawOutput": {"output": output},
             })
 
+        elif et == "tool_state_change":
+            # Send in-progress updates for running tools (fix warning #3)
+            call_id = data.get("tool_call_id", "")
+            new_state = data.get("state", "")
+            if call_id:
+                if new_state == "running":
+                    await self._session_update(session_id, {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call_id,
+                        "status": TOOL_STATUS_IN_PROGRESS,
+                    })
+                elif new_state in ("rejected", "cancelled"):
+                    await self._session_update(session_id, {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call_id,
+                        "status": TOOL_STATUS_CANCELLED,
+                        "content": [{"type": "content",
+                                     "content": {"type": "text", "text": f"[{new_state}]"}}],
+                    })
+
         elif et == "tool_log":
-            msg = data.get("message", "")
+            # ml-intern uses "log" key, "message" as fallback — fix warning #4
+            msg = data.get("log") or data.get("message", "")
             if msg:
                 await self._session_update(session_id, {
                     "sessionUpdate": "agent_message_chunk",
@@ -336,11 +408,11 @@ class MlInternAcpServer:
         # --- Turn lifecycle ---
         elif et == "turn_complete":
             if state.turn_future and not state.turn_future.done():
-                state.turn_future.set_result("end_turn")
+                state.turn_future.set_result(STOP_END_TURN)
 
         elif et == "interrupted":
             if state.turn_future and not state.turn_future.done():
-                state.turn_future.set_result("cancelled")
+                state.turn_future.set_result(STOP_CANCELLED)
 
         elif et == "error":
             err_msg = data.get("error", "Unknown error")
@@ -348,17 +420,21 @@ class MlInternAcpServer:
                 "sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": f"[error] {err_msg}\n"},
             })
+            # Use "refusal" as the closest valid ACP stop reason for errors
+            # (fix warning #5: "error" is not a valid ACP stop reason)
             if state.turn_future and not state.turn_future.done():
-                state.turn_future.set_result("error")
+                state.turn_future.set_result(STOP_REFUSAL)
 
         # Silently absorb events with no ACP mapping
-        # (compacted, processing, assistant_stream_end, tool_state_change,
+        # (compacted, processing, assistant_stream_end,
         #  resume_complete, undo_complete, session_terminated)
 
     async def _handle_approvals(self, state: _SessionState, data: dict) -> None:
         """
         One requestPermission per tool.  Collect all responses, then submit
         a single EXEC_APPROVAL back to ml-intern.
+
+        Fix critical issue #4: correct ACP method name + field shapes.
         """
         session_id = state.session_id
         tools_data: list[dict] = data.get("tools", [])
@@ -371,16 +447,27 @@ class MlInternAcpServer:
             call_id = tool_info.get("tool_call_id", str(uuid.uuid4()))
             raw_input = tool_info.get("arguments", {})
 
+            # First, emit a pending tool_call so Happy shows it in the UI
+            await self._session_update(session_id, {
+                "sessionUpdate": "tool_call",
+                "toolCallId": call_id,
+                "title": tool_name,
+                "kind": TOOL_KIND_EXECUTE,
+                "status": TOOL_STATUS_PENDING,
+                "rawInput": raw_input if isinstance(raw_input, dict) else {},
+            })
+
             try:
+                # Correct ACP method: "session/request_permission" — fix critical issue #4
                 resp = await self._outgoing_request(
-                    "client/requestPermission",
+                    "session/request_permission",
                     {
                         "sessionId": session_id,
                         "toolCall": {
                             "toolCallId": call_id,
                             "title": tool_name,
-                            "kind": "run",
-                            "status": "pending",
+                            "kind": TOOL_KIND_EXECUTE,
+                            "status": TOOL_STATUS_PENDING,
                             "rawInput": raw_input if isinstance(raw_input, dict) else {},
                         },
                         "options": [
@@ -390,12 +477,24 @@ class MlInternAcpServer:
                     },
                 )
                 outcome = (resp or {}).get("outcome", {})
-                approved = (
-                    isinstance(outcome, dict) and outcome.get("optionId") == "allow"
-                )
+                # ACP outcome shape: { outcome: "selected"|"cancelled", optionId: "..." }
+                if isinstance(outcome, dict):
+                    approved = (
+                        outcome.get("outcome") == "selected"
+                        and outcome.get("optionId") == "allow"
+                    )
+                else:
+                    approved = False
             except Exception as e:
                 logger.warning("Permission request failed for %s: %s", tool_name, e)
                 approved = False
+
+            # Update tool_call status based on user decision
+            await self._session_update(session_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": call_id,
+                "status": TOOL_STATUS_IN_PROGRESS if approved else TOOL_STATUS_CANCELLED,
+            })
 
             approvals.append({
                 "tool_call_id": call_id,
@@ -499,7 +598,7 @@ class MlInternAcpServer:
 # ---------------------------------------------------------------------------
 
 def _extract_text(content: list) -> str:
-    """Extract plain text from ACP content blocks."""
+    """Extract plain text from ACP content blocks (prompt or content field)."""
     parts: list[str] = []
     for block in content:
         if isinstance(block, dict):
